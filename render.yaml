@@ -6,8 +6,16 @@ services:
     dockerContext: .
     healthCheckPath: /health
     envVars:
-      - key: OPENAI_API_KEY
+      - key: LOCAL_MODEL_BASE_URL
         sync: false
+      - key: LOCAL_MODEL_NAME
+        value: llama3.2
+      - key: LOCAL_MODEL_API_KEY
+        sync: false
+      - key: API_ACCESS_KEY
+        sync: false
+      - key: REQUIRE_API_KEY
+        value: "true"
       - key: QDRANT_URL
         sync: false
       - key: QDRANT_API_KEY
@@ -27,3 +35,5 @@ services:
           type: web
           name: enterprise-rag-api
           property: host
+      - key: API_ACCESS_KEY
+        sync: false

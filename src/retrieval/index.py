@@ -14,6 +14,10 @@ from src.retrieval.embeddings import embed_texts
 @lru_cache
 def _client() -> QdrantClient:
     settings = get_settings()
+    if settings.qdrant_url.lower() == "local":
+        path = settings.data_dir / "qdrant"
+        path.mkdir(parents=True, exist_ok=True)
+        return QdrantClient(path=str(path))
     return QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
 
 

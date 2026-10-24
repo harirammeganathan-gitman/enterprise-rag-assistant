@@ -4,10 +4,37 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from src.retrieval import index as index_module
 from src.guardrails.validation import is_grounded, validate_input
 from src.ingestion.chunking import _split_text, _token_count, chunk_file
 from src.ingestion.models import DocumentChunk
 from src.retrieval import retriever as retrieval_module
+
+
+def test_local_qdrant_uses_persistent_data_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = SimpleNamespace(
+        qdrant_url="local",
+        qdrant_api_key=None,
+        data_dir=tmp_path,
+    )
+    client_args: dict[str, str] = {}
+
+    def create_client(**kwargs: str) -> dict[str, str]:
+        client_args.update(kwargs)
+        return client_args
+
+    monkeypatch.setattr(index_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(index_module, "QdrantClient", create_client)
+    index_module._client.cache_clear()
+    try:
+        index_module._client()
+    finally:
+        index_module._client.cache_clear()
+
+    assert client_args == {"path": str(tmp_path / "qdrant")}
+    assert (tmp_path / "qdrant").is_dir()
 
 
 def test_recursive_split_respects_size_and_overlap() -> None:

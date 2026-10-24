@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 from datasets import Dataset
@@ -14,14 +13,6 @@ from src.retrieval.retriever import HybridRetriever
 
 def run_evaluation(dataset_path: Path, output_dir: Path) -> Path:
     settings = get_settings()
-    if not settings.openai_api_key:
-        raise RuntimeError(
-            "OPENAI_API_KEY must be configured before running evaluation"
-        )
-    os.environ.setdefault("OPENAI_API_KEY", settings.openai_api_key)
-    if settings.openai_base_url:
-        os.environ.setdefault("OPENAI_BASE_URL", settings.openai_base_url)
-    os.environ.setdefault("OPENAI_MODEL", settings.openai_model)
     try:
         from ragas import evaluate
         from ragas.metrics import (
@@ -30,10 +21,19 @@ def run_evaluation(dataset_path: Path, output_dir: Path) -> Path:
             context_recall,
             faithfulness,
         )
+        from langchain_huggingface import HuggingFaceEmbeddings
+        from langchain_openai import ChatOpenAI
     except ImportError as error:
         raise RuntimeError(
             "Install the evaluation dependencies with requirements.txt"
         ) from error
+    llm = ChatOpenAI(
+        model=settings.local_model_name,
+        base_url=settings.local_model_base_url,
+        api_key=settings.local_model_api_key,
+        temperature=0,
+    )
+    embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
 
     questions = json.loads(dataset_path.read_text(encoding="utf-8"))
     retriever = HybridRetriever()
@@ -52,6 +52,8 @@ def run_evaluation(dataset_path: Path, output_dir: Path) -> Path:
     scores = evaluate(
         Dataset.from_list(records),
         metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+        llm=llm,
+        embeddings=embeddings,
     )
     dataframe = scores.to_pandas()
     output_dir.mkdir(parents=True, exist_ok=True)

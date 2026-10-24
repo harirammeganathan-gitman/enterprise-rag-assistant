@@ -1,9 +1,10 @@
 """FastAPI endpoints for chat, document ingestion, and service health."""
 
+import secrets
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from src.config import get_settings
@@ -15,7 +16,6 @@ from src.retrieval.index import index_chunks
 from src.retrieval.retriever import HybridRetriever
 
 app = FastAPI(title=get_settings().app_name, version="0.1.0")
-retriever = HybridRetriever()
 
 
 class ChatRequest(BaseModel):
@@ -41,13 +41,28 @@ class IngestResponse(BaseModel):
     chunks_indexed: int
 
 
+def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    settings = get_settings()
+    expected_key = settings.api_access_key
+    if not expected_key:
+        if settings.require_api_key:
+            raise HTTPException(
+                status_code=503, detail="API access key is not configured"
+            )
+        return
+    if x_api_key is None or not secrets.compare_digest(
+        x_api_key.encode("utf-8"), expected_key.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+def chat(request: ChatRequest, _: None = Depends(verify_api_key)) -> ChatResponse:
     try:
         validate_input(request.query)
         cache = SemanticCache()
@@ -56,7 +71,7 @@ def chat(request: ChatRequest) -> ChatResponse:
             return ChatResponse(
                 answer=cached["answer"], citations=cached["citations"], cached=True
             )
-        results = retriever.retrieve(request.query, request.top_k)
+        results = HybridRetriever().retrieve(request.query, request.top_k)
         if not results:
             raise HTTPException(
                 status_code=404, detail="No indexed documents are available"
@@ -87,7 +102,10 @@ def chat(request: ChatRequest) -> ChatResponse:
 
 
 @app.post("/ingest", response_model=IngestResponse)
-async def ingest(files: list[UploadFile] = File(...)) -> IngestResponse:
+async def ingest(
+    files: list[UploadFile] = File(...),
+    _: None = Depends(verify_api_key),
+) -> IngestResponse:
     if not files:
         raise HTTPException(status_code=400, detail="At least one file is required")
     upload_dir = get_settings().data_dir / "uploads"
