@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: enterprise-rag-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: DATA_DIR
+        value: /app/data/index
+
+  - type: web
+    name: enterprise-rag-ui
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: streamlit run app/ui.py --server.address=0.0.0.0 --server.port=10000
+    envVars:
+      - key: API_URL
+        fromService:
+          type: web
+          name: enterprise-rag-api
+          property: host

@@ -1,0 +1,21 @@
+name: Deploy to Render
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || vars.RENDER_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy hook
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$DEPLOY_HOOK_URL" ]; then
+            echo "Set the RENDER_DEPLOY_HOOK_URL repository secret before deploying."
+            exit 1
+          fi
+          curl --fail --silent --show-error --request POST "$DEPLOY_HOOK_URL"
