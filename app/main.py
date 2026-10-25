@@ -1,5 +1,6 @@
 """FastAPI endpoints for chat, document ingestion, and service health."""
 
+import re
 import secrets
 from pathlib import Path
 from uuid import uuid4
@@ -41,6 +42,21 @@ class IngestResponse(BaseModel):
     chunks_indexed: int
 
 
+def _small_talk_response(query: str) -> str | None:
+    normalized = " ".join(re.findall(r"[\w']+", query.lower()))
+    if re.fullmatch(r"(hi|hello|hey|hiya|yo|greetings)( there)?", normalized):
+        return "Hello! How can I help you today?"
+    if re.fullmatch(r"good (morning|afternoon|evening|day)", normalized):
+        return "Hello! How can I help you today?"
+    if re.fullmatch(r"how are you( doing)?|how's it going|what's up", normalized):
+        return "I'm doing well, thanks! What can I help you with?"
+    if re.fullmatch(r"thanks( so much)?|thank you( so much)?", normalized):
+        return "You're welcome! Let me know if you have another question."
+    if re.fullmatch(r"bye|goodbye|see you( later)?", normalized):
+        return "Goodbye! Feel free to come back if you need anything."
+    return None
+
+
 def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
     settings = get_settings()
     expected_key = settings.api_access_key
@@ -65,6 +81,9 @@ def health() -> dict[str, str]:
 def chat(request: ChatRequest, _: None = Depends(verify_api_key)) -> ChatResponse:
     try:
         validate_input(request.query)
+        small_talk = _small_talk_response(request.query)
+        if small_talk:
+            return ChatResponse(answer=small_talk, citations=[])
         cache = SemanticCache()
         cached = cache.get(request.query)
         if cached:

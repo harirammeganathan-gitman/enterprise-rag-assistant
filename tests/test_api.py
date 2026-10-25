@@ -27,6 +27,26 @@ def test_chat_rejects_empty_query() -> None:
     assert response.status_code == 422
 
 
+def test_chat_answers_greetings_without_retrieval_or_generation(monkeypatch) -> None:
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("Small talk must not retrieve documents or call the LLM")
+
+    monkeypatch.setattr("app.main.HybridRetriever", fail_if_called)
+    monkeypatch.setattr("app.main.generate_answer", fail_if_called)
+    monkeypatch.setattr("app.main.SemanticCache", fail_if_called)
+
+    for query, expected in (
+        ("hi", "Hello! How can I help you today?"),
+        ("Hello!", "Hello! How can I help you today?"),
+        ("how are you?", "I'm doing well, thanks! What can I help you with?"),
+    ):
+        response = client.post("/chat", json={"query": query})
+
+        assert response.status_code == 200
+        assert response.json()["answer"] == expected
+        assert response.json()["citations"] == []
+
+
 def test_chat_requires_configured_api_key(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.main.get_settings",
