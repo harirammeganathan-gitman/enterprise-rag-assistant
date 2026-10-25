@@ -1,12 +1,29 @@
 """FastAPI endpoints for chat, document ingestion, and service health."""
 
+import re
 import secrets
+import threading
+import time
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 from pydantic import BaseModel, Field, field_validator
+from qdrant_client.http.exceptions import ApiException
+from urllib.parse import urlsplit
 
 from src.config import get_settings
 from src.conversation.router import Intent, route_message
@@ -14,10 +31,16 @@ from src.generation.answer import generate_answer
 from src.guardrails.cache import SemanticCache
 from src.guardrails.validation import is_grounded, validate_input
 from src.ingestion.chunking import chunk_file
-from src.retrieval.index import index_chunks
+from src.retrieval.index import _client, index_chunks
 from src.retrieval.retriever import HybridRetriever
 
 app = FastAPI(title=get_settings().app_name, version="0.1.0")
+ADMIN_SESSION_TTL_SECONDS = 1800
+ADMIN_LOGIN_WINDOW_SECONDS = 900
+ADMIN_LOGIN_MAX_ATTEMPTS = 5
+_password_hasher = PasswordHasher()
+_login_lock = threading.Lock()
+_failed_admin_logins: dict[str, list[float]] = {}
 
 
 class ChatTurn(BaseModel):
@@ -57,6 +80,17 @@ class IngestResponse(BaseModel):
     chunks_indexed: int
 
 
+class AdminLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024, repr=False)
+
+
+class AdminLoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
 def _document_history(history: list[ChatTurn]) -> list[dict[str, str]]:
     relevant: list[dict[str, str]] = []
     pending_user: ChatTurn | None = None
@@ -93,9 +127,237 @@ def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def _admin_token_serializer() -> URLSafeTimedSerializer:
+    secret = get_settings().admin_session_secret
+    if not secret:
+        raise HTTPException(
+            status_code=503, detail="Admin authentication is not configured"
+        )
+    return URLSafeTimedSerializer(secret, salt="admin-session-v1")
+
+
+def verify_admin_token(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, str]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid or expired admin session")
+    serializer = _admin_token_serializer()
+    try:
+        claims = serializer.loads(
+            authorization.removeprefix("Bearer "),
+            max_age=ADMIN_SESSION_TTL_SECONDS,
+        )
+    except BadSignature as error:
+        raise HTTPException(
+            status_code=401, detail="Invalid or expired admin session"
+        ) from error
+    settings = get_settings()
+    if (
+        not settings.admin_username
+        or claims.get("role") != "admin"
+        or claims.get("sub") != settings.admin_username
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or expired admin session")
+    return claims
+
+
+def _login_attempts_remaining(client_key: str, now: float) -> int:
+    with _login_lock:
+        for key in list(_failed_admin_logins):
+            recent = [
+                attempt
+                for attempt in _failed_admin_logins[key]
+                if now - attempt < ADMIN_LOGIN_WINDOW_SECONDS
+            ]
+            if recent:
+                _failed_admin_logins[key] = recent
+            else:
+                del _failed_admin_logins[key]
+        return ADMIN_LOGIN_MAX_ATTEMPTS - len(_failed_admin_logins.get(client_key, []))
+
+
+def _record_failed_admin_login(client_key: str, now: float) -> None:
+    with _login_lock:
+        _failed_admin_logins.setdefault(client_key, []).append(now)
+
+
+def _clear_failed_admin_logins(client_key: str) -> None:
+    with _login_lock:
+        _failed_admin_logins.pop(client_key, None)
+
+
+@app.post("/admin/login", response_model=AdminLoginResponse)
+def admin_login(
+    credentials: AdminLoginRequest,
+    request: Request,
+    _: None = Depends(verify_api_key),
+) -> AdminLoginResponse:
+    settings = get_settings()
+    if not all(
+        (
+            settings.admin_username,
+            settings.admin_password_hash,
+            settings.admin_session_secret,
+        )
+    ):
+        raise HTTPException(
+            status_code=503, detail="Admin authentication is not configured"
+        )
+
+    client_key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    if _login_attempts_remaining(client_key, now) <= 0:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Try again later.",
+        )
+
+    username_matches = secrets.compare_digest(
+        credentials.username.encode("utf-8"),
+        settings.admin_username.encode("utf-8"),
+    )
+    try:
+        password_matches = _password_hasher.verify(
+            settings.admin_password_hash, credentials.password
+        )
+    except VerifyMismatchError:
+        password_matches = False
+    except (InvalidHashError, VerificationError) as error:
+        raise HTTPException(
+            status_code=503, detail="Admin password hash configuration is invalid"
+        ) from error
+
+    if not username_matches or not password_matches:
+        _record_failed_admin_login(client_key, now)
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    _clear_failed_admin_logins(client_key)
+    token = _admin_token_serializer().dumps(
+        {"sub": settings.admin_username, "role": "admin"}
+    )
+    return AdminLoginResponse(
+        access_token=token,
+        expires_in=ADMIN_SESSION_TTL_SECONDS,
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _qdrant_status() -> dict[str, str | int | bool]:
+    collection_name = get_settings().qdrant_collection
+    try:
+        client = _client()
+        collections = client.get_collections().collections
+        collection_exists = any(item.name == collection_name for item in collections)
+        count = (
+            client.count(collection_name=collection_name, exact=True).count
+            if collection_exists
+            else 0
+        )
+    except ApiException as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve ingestion status from Qdrant",
+        ) from error
+    return {
+        "status": "active",
+        "collection_name": collection_name,
+        "collection_exists": collection_exists,
+        "total_chunks_ingested": count,
+        "has_documents": count > 0,
+    }
+
+
+@app.get("/status")
+def get_ingestion_status(
+    _: None = Depends(verify_api_key),
+) -> dict[str, str | int | bool]:
+    return _qdrant_status()
+
+
+@app.get("/admin/status")
+def get_admin_status(
+    _: dict[str, str] = Depends(verify_admin_token),
+) -> dict[str, str | int | bool]:
+    return _qdrant_status()
+
+
+@app.get("/admin/config")
+def get_admin_config(
+    _: dict[str, str] = Depends(verify_admin_token),
+) -> dict[str, str | bool]:
+    settings = get_settings()
+    qdrant_host = urlsplit(
+        settings.qdrant_url
+        if "://" in settings.qdrant_url
+        else f"https://{settings.qdrant_url}"
+    ).hostname
+    llm_host = urlsplit(settings.local_model_base_url).hostname
+    return {
+        "qdrant_host": qdrant_host or "local embedded",
+        "qdrant_collection": settings.qdrant_collection,
+        "qdrant_api_key_configured": bool(settings.qdrant_api_key),
+        "llm_host": llm_host or "not configured",
+        "llm_model": settings.local_model_name,
+        "llm_api_key_configured": bool(settings.local_model_api_key),
+        "embedding_model": settings.embedding_model,
+        "reranker_model": settings.reranker_model,
+        "api_access_key_configured": bool(settings.api_access_key),
+    }
+
+
+@app.get("/admin/chunks")
+def get_admin_chunks(
+    offset: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=50, ge=1, le=100),
+    _: dict[str, str] = Depends(verify_admin_token),
+) -> dict[str, object]:
+    settings = get_settings()
+    status = _qdrant_status()
+    if not status["collection_exists"]:
+        return {"chunks": [], "next_page_offset": None}
+    try:
+        points, next_page_offset = _client().scroll(
+            collection_name=settings.qdrant_collection,
+            limit=limit,
+            offset=offset,
+            with_payload=["source", "chunk_index", "page_number"],
+            with_vectors=False,
+        )
+    except ApiException as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve chunk details from Qdrant",
+        ) from error
+
+    chunks = []
+    for point in points:
+        payload = point.payload or {}
+        source = str(payload.get("source") or "Unknown document")
+        filename = source.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
+        filename = re.sub(r"^[0-9a-fA-F]{32}_", "", filename)
+        chunks.append(
+            {
+                "document": filename,
+                "chunk_index": payload.get("chunk_index"),
+                "page_number": payload.get("page_number"),
+            }
+        )
+    return {
+        "chunks": chunks,
+        "next_page_offset": str(next_page_offset) if next_page_offset else None,
+    }
+
+
+@app.post("/admin/ingest", response_model=IngestResponse)
+async def admin_ingest(
+    files: list[UploadFile] = File(...),
+    _: dict[str, str] = Depends(verify_admin_token),
+) -> IngestResponse:
+    return await _ingest_files(files)
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -183,6 +445,10 @@ async def ingest(
     files: list[UploadFile] = File(...),
     _: None = Depends(verify_api_key),
 ) -> IngestResponse:
+    return await _ingest_files(files)
+
+
+async def _ingest_files(files: list[UploadFile]) -> IngestResponse:
     if not files:
         raise HTTPException(status_code=400, detail="At least one file is required")
     upload_dir = get_settings().data_dir / "uploads"

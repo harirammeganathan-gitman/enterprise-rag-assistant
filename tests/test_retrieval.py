@@ -37,6 +37,33 @@ def test_local_qdrant_uses_persistent_data_directory(
     assert (tmp_path / "qdrant").is_dir()
 
 
+def test_remote_qdrant_uses_configured_url_and_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(
+        qdrant_url="https://cluster.example",
+        qdrant_api_key="test-secret",
+    )
+    client_args: dict[str, str] = {}
+
+    def create_client(**kwargs: str) -> dict[str, str]:
+        client_args.update(kwargs)
+        return client_args
+
+    monkeypatch.setattr(index_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(index_module, "QdrantClient", create_client)
+    index_module._client.cache_clear()
+    try:
+        index_module._client()
+    finally:
+        index_module._client.cache_clear()
+
+    assert client_args == {
+        "url": "https://cluster.example",
+        "api_key": "test-secret",
+    }
+
+
 def test_recursive_split_respects_size_and_overlap() -> None:
     text = " ".join(f"word{index}" for index in range(1100))
     chunks = _split_text(text, chunk_size=100, overlap=12)

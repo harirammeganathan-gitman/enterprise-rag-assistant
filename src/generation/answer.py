@@ -46,14 +46,14 @@ def generate_answer(
         )
     except APIConnectionError as error:
         raise RuntimeError(
-            "Cannot connect to the local model. Start Ollama and run "
-            f"`ollama pull {settings.local_model_name}`."
+            "Cannot connect to the configured language model endpoint. "
+            "Check LLM_BASE_URL and network connectivity."
         ) from error
     except APIStatusError as error:
         raise RuntimeError(
-            f"Ollama returned an error ({error.status_code}): {error}. "
-            f"Confirm `{settings.local_model_name}` is available with "
-            "`ollama list`."
+            f"The configured language model endpoint returned an error "
+            f"({error.status_code}): {error}. Check LLM_MODEL_NAME and "
+            "the provider's model access settings."
         ) from error
     answer = completion.choices[0].message.content
     if not answer:

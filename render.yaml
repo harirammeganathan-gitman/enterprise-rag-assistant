@@ -14,12 +14,20 @@ services:
         sync: false
       - key: API_ACCESS_KEY
         sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD_HASH
+        sync: false
+      - key: ADMIN_SESSION_SECRET
+        sync: false
       - key: REQUIRE_API_KEY
         value: "true"
       - key: QDRANT_URL
         sync: false
       - key: QDRANT_API_KEY
         sync: false
+      - key: QDRANT_COLLECTION
+        value: documents
       - key: DATA_DIR
         value: /app/data/index
 

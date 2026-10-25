@@ -45,7 +45,8 @@ optional alternative.
    Ollama normally runs as a background service on Windows. If it is not
    running, start it with `ollama serve` in another terminal. Leave
    `LOCAL_MODEL_BASE_URL=http://localhost:11434/v1` and
-   `LOCAL_MODEL_NAME=llama3.2` in `.env`. Leave `QDRANT_URL=local`. Start the API:
+   `LOCAL_MODEL_NAME=llama3.2` in `.env`. For the embedded local Qdrant database,
+   leave `QDRANT_URL=local`. Start the API:
 
    ```powershell
    .venv\Scripts\python.exe -m uvicorn app.main:app --reload
@@ -54,6 +55,64 @@ optional alternative.
    Local Qdrant data is persisted in `data\index\qdrant`. The API process owns
    this embedded database; do not start multiple API workers against the same
    local data path.
+
+### Use the hosted Qdrant cluster locally
+
+The local API can use the hosted Qdrant cluster while keeping its vectors
+separate from production. In the ignored local `.env` file, set:
+
+```dotenv
+QDRANT_URL=https://your-qdrant-cluster-endpoint
+QDRANT_API_KEY=your-local-qdrant-api-key
+QDRANT_COLLECTION=documents_local
+```
+
+Replace the endpoint and key with your Qdrant cluster values; do not commit
+`.env` or share the API key. The Render API uses the separate `documents`
+collection. The Qdrant key must permit creating and reading/writing the local
+collection. This repository's local `.env` uses `documents_local`; do not
+change it to `documents` unless you intentionally want local ingestion and
+production to share vectors. Restart the local API after changing these
+settings, then ingest documents through the local UI. Qdrant vectors are stored
+in the cluster, while the local BM25 corpus and semantic cache remain under
+`DATA_DIR` on your computer. This setup does not automatically expose production
+documents to local chat.
+
+To use a hosted OpenAI-compatible language model locally, set `LLM_BASE_URL`,
+`LLM_MODEL_NAME`, and `LLM_API_KEY` in `.env`. These take precedence over the
+legacy `LOCAL_MODEL_*` variables, which remain supported for local Ollama.
+Restart the API after changing model settings.
+
+### Admin portal credentials
+
+The UI opens in chat-only mode. To enable its **Admin** portal, configure these
+secrets on both the local API and the Render API service:
+
+- `ADMIN_USERNAME`: the administrator login name.
+- `ADMIN_PASSWORD_HASH`: an Argon2id hash, not the plaintext password.
+- `ADMIN_SESSION_SECRET`: a unique signing secret generated with
+  `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+
+Generate the password hash interactively so the plaintext is not included in
+the command or shell history:
+
+```powershell
+python -m src.admin.create_password_hash
+```
+
+Copy the printed hash into the ignored local `.env` as `ADMIN_PASSWORD_HASH`.
+Set the same variable names in the Render API service's secret environment.
+Never put the plaintext password, hash, or session signing secret in source
+control. The UI sends credentials to the API over its server-side connection;
+the API verifies the password with Argon2id and issues a signed admin session
+that expires after 30 minutes. Five failed logins from the same client address
+are temporarily throttled in each API process.
+
+Only after successful login does the UI show document ingestion, chunk
+metadata, Qdrant status, and safe service configuration. API keys are never
+returned by the admin endpoints. Configure HTTPS for public deployments. The
+login throttle is process-local; deployments with multiple API instances that
+need coordinated lockout should use a shared rate-limiting store.
 
 3. Upload the included handbook in the UI sidebar and click **Ingest documents**.
    Alternatively, start the optional Docker Compose stack instead of the local
@@ -83,6 +142,16 @@ instance, set `QDRANT_URL` and optionally `QDRANT_API_KEY`.
 ## API
 
 - `GET /health` — liveness check.
+- `GET /status` — authenticated Qdrant collection status and exact indexed chunk
+  count. Requires the `X-API-Key` header when API-key authentication is enabled.
+- `POST /admin/login` — verifies the admin username and Argon2id password hash
+  and issues a signed 30-minute bearer token. It also requires the service
+  `X-API-Key` when API-key authentication is enabled.
+- `GET /admin/status`, `GET /admin/config`, and `GET /admin/chunks` — admin-only
+  status and sanitized metadata endpoints. Require the signed admin bearer
+  token. Configuration responses expose service hosts and whether keys are
+  configured, never secret values.
+- `POST /admin/ingest` — admin-token-protected document ingestion for the UI.
 - `POST /ingest` — multipart upload; accepts `.pdf`, `.md`, `.markdown`, and
   `.docx` files, extracts/chunks them, and indexes them.
 - `POST /chat` — accepts `{"query": "...", "top_k": 4, "history": [...]}`.
@@ -144,6 +213,9 @@ pre-commit install
 ```
 
 GitHub Actions runs tests and style checks on pushes and pull requests.
+The **PR Gateway** workflow also builds the production Docker image. To block
+merges when any gateway check fails, configure the repository's `main` branch
+protection (or ruleset) to require the **PR Gateway / checks** status check.
 
 ## Deploying to Render
 
@@ -164,6 +236,11 @@ environment values:
   the API and UI services. Render requires it for `/chat` and `/ingest`; the UI
   sends it as the `X-API-Key` header. Do not commit it or put it in a public
   frontend.
+- `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, and `ADMIN_SESSION_SECRET`: configure
+  these on the API service to enable protected admin login. Generate the Argon2id
+  hash using `python -m src.admin.create_password_hash` and generate a separate
+  signing secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+  Keep the plaintext password and signing secret private; never commit them.
 
 After deployment, copy the API service's public URL from Render (for example,
 `https://enterprise-rag-api.onrender.com`). Check its public health endpoint:
