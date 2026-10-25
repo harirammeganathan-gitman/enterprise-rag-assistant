@@ -1,14 +1,15 @@
 """FastAPI endpoints for chat, document ingestion, and service health."""
 
-import re
 import secrets
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.config import get_settings
+from src.conversation.router import Intent, route_message
 from src.generation.answer import generate_answer
 from src.guardrails.cache import SemanticCache
 from src.guardrails.validation import is_grounded, validate_input
@@ -19,9 +20,23 @@ from src.retrieval.retriever import HybridRetriever
 app = FastAPI(title=get_settings().app_name, version="0.1.0")
 
 
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
 class ChatRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4000)
     top_k: int | None = Field(default=None, ge=1, le=20)
+    history: list[ChatTurn] = Field(default_factory=list, max_length=8)
+
+    @field_validator("history")
+    @classmethod
+    def validate_history_size(cls, history: list[ChatTurn]) -> list[ChatTurn]:
+        total_characters = sum(len(turn.content) for turn in history)
+        if total_characters > 8000:
+            raise ValueError("Conversation history must not exceed 8000 characters")
+        return history
 
 
 class Citation(BaseModel):
@@ -42,19 +57,25 @@ class IngestResponse(BaseModel):
     chunks_indexed: int
 
 
-def _small_talk_response(query: str) -> str | None:
-    normalized = " ".join(re.findall(r"[\w']+", query.lower()))
-    if re.fullmatch(r"(hi|hello|hey|hiya|yo|greetings)( there)?", normalized):
-        return "Hello! How can I help you today?"
-    if re.fullmatch(r"good (morning|afternoon|evening|day)", normalized):
-        return "Hello! How can I help you today?"
-    if re.fullmatch(r"how are you( doing)?|how's it going|what's up", normalized):
-        return "I'm doing well, thanks! What can I help you with?"
-    if re.fullmatch(r"thanks( so much)?|thank you( so much)?", normalized):
-        return "You're welcome! Let me know if you have another question."
-    if re.fullmatch(r"bye|goodbye|see you( later)?", normalized):
-        return "Goodbye! Feel free to come back if you need anything."
-    return None
+def _document_history(history: list[ChatTurn]) -> list[dict[str, str]]:
+    relevant: list[dict[str, str]] = []
+    pending_user: ChatTurn | None = None
+    for turn in history:
+        if turn.role == "user":
+            pending_user = turn
+        elif pending_user is not None:
+            intent = route_message(
+                pending_user.content, has_history=bool(relevant)
+            ).intent
+            if intent in {Intent.DOCUMENT_QUESTION, Intent.FOLLOW_UP}:
+                relevant.extend(
+                    [
+                        {"role": "user", "content": pending_user.content},
+                        {"role": "assistant", "content": turn.content},
+                    ]
+                )
+            pending_user = None
+    return relevant[-8:]
 
 
 def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -81,22 +102,58 @@ def health() -> dict[str, str]:
 def chat(request: ChatRequest, _: None = Depends(verify_api_key)) -> ChatResponse:
     try:
         validate_input(request.query)
-        small_talk = _small_talk_response(request.query)
-        if small_talk:
-            return ChatResponse(answer=small_talk, citations=[])
-        cache = SemanticCache()
-        cached = cache.get(request.query)
-        if cached:
+        for turn in request.history:
+            if turn.role == "user":
+                validate_input(turn.content)
+        history = _document_history(request.history)
+        route = route_message(request.query, has_history=bool(history))
+        if route.response:
+            return ChatResponse(answer=route.response, citations=[])
+
+        retrieval_query = request.query
+        if route.intent == Intent.FOLLOW_UP:
+            previous_user = next(
+                (
+                    turn["content"]
+                    for turn in reversed(history)
+                    if turn["role"] == "user"
+                ),
+                "",
+            )
+            previous_assistant = next(
+                (
+                    turn["content"]
+                    for turn in reversed(history)
+                    if turn["role"] == "assistant"
+                ),
+                "",
+            )
+            retrieval_query = (
+                f"Previous question: {previous_user}\n"
+                f"Previous answer: {previous_assistant}\n"
+                f"Follow-up: {request.query}"
+            )
+
+        cache = None
+        cached = None
+        if route.intent != Intent.FOLLOW_UP:
+            cache = SemanticCache()
+            cached = cache.get(request.query)
+        if cached is not None:
             return ChatResponse(
                 answer=cached["answer"], citations=cached["citations"], cached=True
             )
-        results = HybridRetriever().retrieve(request.query, request.top_k)
+        results = HybridRetriever().retrieve(retrieval_query, request.top_k)
         if not results:
             raise HTTPException(
                 status_code=404, detail="No indexed documents are available"
             )
         contexts = [item["text"] for item in results]
-        answer = generate_answer(request.query, contexts)
+        answer = generate_answer(
+            request.query,
+            contexts,
+            history=history if route.intent == Intent.FOLLOW_UP else None,
+        )
         if not is_grounded(answer, contexts):
             raise HTTPException(
                 status_code=502,
@@ -112,7 +169,8 @@ def chat(request: ChatRequest, _: None = Depends(verify_api_key)) -> ChatRespons
             for item in results
         ]
         response = ChatResponse(answer=answer, citations=citations)
-        cache.put(request.query, response.model_dump())
+        if cache is not None:
+            cache.put(request.query, response.model_dump())
         return response
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

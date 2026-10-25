@@ -7,6 +7,8 @@ import streamlit as st
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000").rstrip("/")
 API_ACCESS_KEY = os.environ.get("API_ACCESS_KEY")
+MAX_SESSION_MESSAGES = 40
+MAX_API_HISTORY_MESSAGES = 8
 if not API_URL.startswith(("http://", "https://")):
     API_URL = f"https://{API_URL}"
 
@@ -66,19 +68,28 @@ for message in st.session_state.chat_history:
 
 query = st.chat_input("Ask about your documents")
 if query:
-    user_message = {"role": "user", "content": query}
-    st.session_state.chat_history.append(user_message)
+    history = st.session_state.chat_history[-MAX_API_HISTORY_MESSAGES:]
     with st.chat_message("user"):
         st.markdown(query)
 
     with st.chat_message("assistant"):
         with st.spinner("Searching documents and preparing an answer..."):
-            response = post_to_api("/chat", json={"query": query}, timeout=180)
+            response = post_to_api(
+                "/chat",
+                json={"query": query, "history": history},
+                timeout=180,
+            )
             if response is not None and response.ok:
                 answer = response.json()["answer"]
                 st.markdown(answer)
-                st.session_state.chat_history.append(
-                    {"role": "assistant", "content": answer}
+                st.session_state.chat_history.extend(
+                    [
+                        {"role": "user", "content": query},
+                        {"role": "assistant", "content": answer},
+                    ]
                 )
+                st.session_state.chat_history = st.session_state.chat_history[
+                    -MAX_SESSION_MESSAGES:
+                ]
             elif response is not None:
                 st.error(f"Request failed ({response.status_code}): {response.text}")

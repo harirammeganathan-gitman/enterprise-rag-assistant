@@ -85,14 +85,33 @@ instance, set `QDRANT_URL` and optionally `QDRANT_API_KEY`.
 - `GET /health` — liveness check.
 - `POST /ingest` — multipart upload; accepts `.pdf`, `.md`, `.markdown`, and
   `.docx` files, extracts/chunks them, and indexes them.
-- `POST /chat` — JSON body `{"query": "...", "top_k": 4}`; returns an answer,
-  source/page/chunk citations, rerank scores, and whether the response was cached.
+- `POST /chat` — accepts `{"query": "...", "top_k": 4, "history": [...]}`.
+  `history` is optional and contains up to 8 prior `{ "role": "user" |
+  "assistant", "content": "..." }` messages, with an 8,000-character total limit.
+  The UI sends recent messages from the current Streamlit session so contextual
+  follow-ups can be resolved. Social messages and acknowledgements are handled
+  without retrieval or LLM calls; follow-ups without relevant history receive a
+  clarification prompt. Context-dependent follow-ups bypass the semantic cache.
+  The endpoint returns an answer, source/page/chunk citations, rerank scores,
+  and whether the response was cached.
 
 For example:
 
 ```powershell
 curl.exe -X POST http://localhost:8000/ingest -F "files=@data\sample_docs\company_handbook.md"
 curl.exe -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d "{\"query\":\"How many days of annual leave do employees receive?\"}"
+```
+
+For a contextual follow-up, include the preceding user and assistant turns:
+
+```json
+{
+  "query": "Why?",
+  "history": [
+    {"role": "user", "content": "How much annual leave is provided?"},
+    {"role": "assistant", "content": "The policy provides 20 days of annual leave."}
+  ]
+}
 ```
 
 The local semantic cache uses normalized embedding cosine similarity with a
